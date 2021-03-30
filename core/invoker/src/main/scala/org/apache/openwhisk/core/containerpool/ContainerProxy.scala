@@ -301,6 +301,16 @@ class ContainerProxy(factory: (TransactionId,
     case Event(job: Run, _) =>
       implicit val transid = job.msg.transid
       activeCount += 1
+      // get the memory size and cpu share
+      val memorySize = job.action.limits.memory.megabytes
+      // if there's '-' in the action name, cpu share is defined to be the number after the '-'
+      // otherwise, cpu share is calculated in the default way, i.e., proportional to the memory size
+      var cpuShare = poolConfig.cpuShare(job.action.limits.memory.megabytes.MB) // default way of cpu share calculation
+      val indexOfSeparator = job.action.name.name.indexOf("-")
+      if (indexOfSeparator != -1) {
+        cpuShare = job.action.name.name.substring(indexOfSeparator + 1).toInt
+      }
+
       // create a new container
       val container = factory(
         job.msg.transid,
@@ -308,8 +318,13 @@ class ContainerProxy(factory: (TransactionId,
         job.action.exec.image,
         job.action.exec.pull,
         job.action.limits.memory.megabytes.MB,
-        poolConfig.cpuShare(job.action.limits.memory.megabytes.MB),
+        // poolConfig.cpuShare(job.action.limits.memory.megabytes.MB),
+        cpuShare,
         Some(job.action))
+
+      // haoran
+      logging.info(this, s"[haoran] cold start BEFORE - name: ${job.action.name} | memory: ${memorySize}MB | cpu share: ${poolConfig.cpuShare(job.action.limits.memory.megabytes.MB)}")
+      logging.info(this, s"[haoran] cold start AFTER - name: ${job.action.name} | memory: ${memorySize}MB | cpu share: ${cpuShare}")
 
       // container factory will either yield a new container ready to execute the action, or
       // starting up the container failed; for the latter, it's either an internal error starting
