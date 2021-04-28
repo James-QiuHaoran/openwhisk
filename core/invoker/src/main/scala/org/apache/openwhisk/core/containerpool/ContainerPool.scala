@@ -27,6 +27,7 @@ import org.apache.openwhisk.core.entity.size._
 import scala.annotation.tailrec
 import scala.collection.immutable
 import scala.concurrent.duration._
+import scala.math.Ordered.orderingToOrdered
 import scala.util.{Random, Try}
 
 case class ColdStartKey(kind: String, memory: ByteSize)
@@ -139,10 +140,25 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               takePrewarmContainer(r.action)
                 .map(container => (container, "prewarmed"))
                 .orElse {
+                  // (haoran) check with the horizontal concurrency records
+                  if (ContainerPool.concurrencyRecords.contains(r.action.name.name) && ContainerPool.concurrencyLimits.get(r.action.name.name) <= ContainerPool.concurrencyRecords.get(r.action.name.name)) {
+                    None
+                  }
                   // Is there enough space to create a new container or do other containers have to be removed?
                   if (hasPoolSpaceFor(busyPool ++ freePool ++ prewarmedPool, prewarmStartingPool, memory)) {
                     val container = Some(createContainer(memory), "cold")
                     incrementColdStartCount(kind, memory)
+
+                    // (haoran) increase concurrency record for the function
+                    if (!ContainerPool.concurrencyRecords.contains(r.action.name.name)) {
+                      ContainerPool.concurrencyRecords += {r.action.name.name -> 0}
+                    } else {
+                      ContainerPool.concurrencyRecords(r.action.name.name) += 1
+                    }
+                    logging.info(
+                      this,
+                      s"[haoranq4] current concurrency of ${r.action.name.name} is ${ContainerPool.concurrencyRecords.get(r.action.name.name)}")
+
                     container
                   } else None
                 })
@@ -159,8 +175,27 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   takePrewarmContainer(r.action)
                     .map(container => (container, "recreatedPrewarm"))
                     .getOrElse {
+                      // (haoran) check with the horizontal concurrency records
+                      if (ContainerPool.concurrencyLimits.contains(r.action.name.name)) {
+                        if (ContainerPool.concurrencyRecords.contains(r.action.name.name) && ContainerPool.concurrencyLimits.get(r.action.name.name) <= ContainerPool.concurrencyRecords.get(r.action.name.name)) {
+                          // if limits are specified and current concurrency >= limit
+                          None
+                        }
+                      }
+
                       val container = (createContainer(memory), "recreated")
                       incrementColdStartCount(kind, memory)
+
+                      // (haoran) increase concurrency record for the function
+                      if (!ContainerPool.concurrencyRecords.contains(r.action.name.name)) {
+                        ContainerPool.concurrencyRecords += {r.action.name.name -> 0}
+                      } else {
+                        ContainerPool.concurrencyRecords(r.action.name.name) += 1
+                      }
+                      logging.info(
+                        this,
+                        s"[haoranq4] current concurrency of ${r.action.name.name} is ${ContainerPool.concurrencyRecords.get(r.action.name.name)}")
+
                       container
                   }))
 
@@ -475,6 +510,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
 object ContainerPool {
 
+  // (haoran) for managing horizontal concurrency, i.e., how many containers can be created for a function
+  val concurrencyLimits = scala.collection.mutable.Map("base64_mem256_c4" -> 4, "base64_mem256_c2" -> 2)
+  // (haoran) track how many containers have been created for a function
+  var concurrencyRecords:scala.collection.mutable.Map[String, Int] = scala.collection.mutable.Map()
+
   /**
    * Calculate the memory of a given pool.
    *
@@ -536,7 +576,7 @@ object ContainerPool {
   @tailrec
   protected[containerpool] def remove[A](pool: Map[A, ContainerData],
                                          memory: ByteSize,
-                                         toRemove: List[A] = List.empty): List[A] = {
+                                         toRemove: List[A] = List.empty)(implicit logging: Logging): List[A] = {
     // Try to find a Free container that does NOT have any active activations AND is initialized with any OTHER action
     val freeContainers = pool.collect {
       // Only warm containers will be removed. Prewarmed containers will stay always.
@@ -550,6 +590,13 @@ object ContainerPool {
       // - there are still containers that can be removed
       // - there are enough free containers that can be removed
       val (ref, data) = freeContainers.minBy(_._2.lastUsed)
+
+      // (haoran) decrease the concurrency if removed
+      if (concurrencyRecords.contains(data.action.name.name)) {
+        concurrencyRecords(data.action.name.name) -= 1
+      }
+      logging.info(this, s"[haoranq4] current concurrency of ${data.action.name.name} is ${concurrencyRecords.get(data.action.name.name)}")
+
       // Catch exception if remaining memory will be negative
       val remainingMemory = Try(memory - data.memoryLimit).getOrElse(0.B)
       remove(freeContainers - ref, remainingMemory, toRemove ++ List(ref))
