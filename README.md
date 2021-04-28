@@ -17,6 +17,23 @@
 #
 -->
 
+# Useful Tools
+
+```
+# rebuild invoker/controller and redeploy it
+cd tools/build
+./redo controller -bxd
+./redo invoker -bxd
+```
+
+Configuration location: `ansible/group_vars/all`
+- `user-memory`: default 2048m, meaning that an invoker can only use up to 2GB memory capacity for creating action containers.
+    - used for checking capacity of an invoker to see if a container of memory limit `m` can fit into that invoker;
+- `invocationsPerMinute: "{{ limit_invocations_per_minute | default(60) }}"`
+- `concurrentInvocations: "{{ limit_invocations_concurrent | default(30) }}"`
+- `firesPerMinute: "{{ limit_fires_per_minute | default(60) }}"`
+- `sequenceMaxLength: "{{ limit_sequence_max_length | default(50) }}"`
+
 # OpenWhisk
 
 [![Build Status](https://travis-ci.com/apache/openwhisk.svg?branch=master)](https://travis-ci.com/apache/openwhisk)
