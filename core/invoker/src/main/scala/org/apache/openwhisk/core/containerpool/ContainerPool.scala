@@ -141,26 +141,45 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 .map(container => (container, "prewarmed"))
                 .orElse {
                   // (haoran) check with the horizontal concurrency records
-                  if (ContainerPool.concurrencyRecords.contains(r.action.name.name) && ContainerPool.concurrencyLimits.get(r.action.name.name) <= ContainerPool.concurrencyRecords.get(r.action.name.name)) {
-                    None
-                  }
-                  // Is there enough space to create a new container or do other containers have to be removed?
-                  if (hasPoolSpaceFor(busyPool ++ freePool ++ prewarmedPool, prewarmStartingPool, memory)) {
-                    val container = Some(createContainer(memory), "cold")
-                    incrementColdStartCount(kind, memory)
-
-                    // (haoran) increase concurrency record for the function
-                    if (!ContainerPool.concurrencyRecords.contains(r.action.name.name)) {
-                      ContainerPool.concurrencyRecords += {r.action.name.name -> 0}
-                    } else {
-                      ContainerPool.concurrencyRecords(r.action.name.name) += 1
-                    }
+                  if (ContainerPool.concurrencyLimits.contains(r.action.name.name) &&
+                      ContainerPool.concurrencyRecords.contains(r.action.name.name) &&
+                      ContainerPool.concurrencyLimits.get(r.action.name.name) <= ContainerPool.concurrencyRecords.get(r.action.name.name)) {
                     logging.info(
                       this,
-                      s"[haoranq4] current concurrency of ${r.action.name.name} is ${ContainerPool.concurrencyRecords.get(r.action.name.name)}")
+                      s"[haoranq4] Concurrency Limit Met - current concurrency of ${r.action.name.name} is ${ContainerPool.concurrencyRecords.get(r.action.name.name)} >= ${ContainerPool.concurrencyLimits.get(r.action.name.name)}")
+                    None
+                  } else {
+                    if (!ContainerPool.concurrencyLimits.contains(r.action.name.name)) {
+                      logging.info(
+                        this,
+                        s"[haoranq4] Concurrency Limit Not Met - ${r.action.name.name} does not have a concurrency limit!")
+                    } else if (!ContainerPool.concurrencyRecords.contains(r.action.name.name)) {
+                      logging.info(
+                        this,
+                        s"[haoranq4] Concurrency Limit Not Met - current concurrency of ${r.action.name.name} is 0 < ${ContainerPool.concurrencyLimits.get(r.action.name.name)}")
+                    } else {
+                      logging.info(
+                        this,
+                        s"[haoranq4] Concurrency Limit Not Met - current concurrency of ${r.action.name.name} is ${ContainerPool.concurrencyRecords.get(r.action.name.name)} < ${ContainerPool.concurrencyLimits.get(r.action.name.name)}")
+                    }
+                    // Is there enough space to create a new container or do other containers have to be removed?
+                    if (hasPoolSpaceFor(busyPool ++ freePool ++ prewarmedPool, prewarmStartingPool, memory)) {
+                      val container = Some(createContainer(memory), "cold")
+                      incrementColdStartCount(kind, memory)
 
-                    container
-                  } else None
+                      // (haoran) increase concurrency record for the function
+                      if (!ContainerPool.concurrencyRecords.contains(r.action.name.name)) {
+                        ContainerPool.concurrencyRecords += {r.action.name.name -> 1}
+                      } else {
+                        ContainerPool.concurrencyRecords(r.action.name.name) += 1
+                      }
+                      logging.info(
+                        this,
+                        s"[haoranq4] Added (cold) - current concurrency of ${r.action.name.name} is ${ContainerPool.concurrencyRecords.get(r.action.name.name)}")
+
+                      container
+                    } else None
+                  }
                 })
             .orElse(
               // Remove a container and create a new one for the given job
@@ -175,64 +194,53 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   takePrewarmContainer(r.action)
                     .map(container => (container, "recreatedPrewarm"))
                     .getOrElse {
-                      // (haoran) check with the horizontal concurrency records
-                      if (ContainerPool.concurrencyLimits.contains(r.action.name.name)) {
-                        if (ContainerPool.concurrencyRecords.contains(r.action.name.name) && ContainerPool.concurrencyLimits.get(r.action.name.name) <= ContainerPool.concurrencyRecords.get(r.action.name.name)) {
-                          // if limits are specified and current concurrency >= limit
-                          None
-                        }
-                      }
+                      // (haoran) check concurrency limit before creating containers
+                      val newContainer = createContainerIfUnderConcurrencyLimit(kind, memory, r.action.name.name, "recreated")
+                      newContainer
 
-                      val container = (createContainer(memory), "recreated")
-                      incrementColdStartCount(kind, memory)
-
-                      // (haoran) increase concurrency record for the function
-                      if (!ContainerPool.concurrencyRecords.contains(r.action.name.name)) {
-                        ContainerPool.concurrencyRecords += {r.action.name.name -> 0}
-                      } else {
-                        ContainerPool.concurrencyRecords(r.action.name.name) += 1
-                      }
-                      logging.info(
-                        this,
-                        s"[haoranq4] current concurrency of ${r.action.name.name} is ${ContainerPool.concurrencyRecords.get(r.action.name.name)}")
-
-                      container
-                  }))
+                      // val container = (createContainer(memory), "recreated")
+                      // incrementColdStartCount(kind, memory)
+                      // container
+                  }
+                )
+            )
 
         createdContainer match {
           case Some(((actor, data), containerState)) =>
-            //increment active count before storing in pool map
-            val newData = data.nextRun(r)
-            val container = newData.getContainer
+            if (containerState != "dummy") {
+              //increment active count before storing in pool map
+              val newData = data.nextRun(r)
+              val container = newData.getContainer
 
-            if (newData.activeActivationCount < 1) {
-              logging.error(this, s"invalid activation count < 1 ${newData}")
-            }
-
-            //only move to busyPool if max reached
-            if (!newData.hasCapacity()) {
-              if (r.action.limits.concurrency.maxConcurrent > 1) {
-                logging.info(
-                  this,
-                  s"container ${container} is now busy with ${newData.activeActivationCount} activations")
+              if (newData.activeActivationCount < 1) {
+                logging.error(this, s"invalid activation count < 1 ${newData}")
               }
-              busyPool = busyPool + (actor -> newData)
-              freePool = freePool - actor
-            } else {
-              //update freePool to track counts
-              freePool = freePool + (actor -> newData)
+
+              //only move to busyPool if max reached
+              if (!newData.hasCapacity()) {
+                if (r.action.limits.concurrency.maxConcurrent > 1) {
+                  logging.info(
+                    this,
+                    s"container ${container} is now busy with ${newData.activeActivationCount} activations")
+                }
+                busyPool = busyPool + (actor -> newData)
+                freePool = freePool - actor
+              } else {
+                //update freePool to track counts
+                freePool = freePool + (actor -> newData)
+              }
+              // Remove the action that was just executed from the buffer and execute the next one in the queue.
+              if (isResentFromBuffer) {
+                // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
+                // from the buffer
+                val (_, newBuffer) = runBuffer.dequeue
+                runBuffer = newBuffer
+                // Try to process the next item in buffer (or get another message from feed, if buffer is now empty)
+                processBufferOrFeed()
+              }
+              actor ! r // forwards the run request to the container
+              logContainerStart(r, containerState, newData.activeActivationCount, container)
             }
-            // Remove the action that was just executed from the buffer and execute the next one in the queue.
-            if (isResentFromBuffer) {
-              // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
-              // from the buffer
-              val (_, newBuffer) = runBuffer.dequeue
-              runBuffer = newBuffer
-              // Try to process the next item in buffer (or get another message from feed, if buffer is now empty)
-              processBufferOrFeed()
-            }
-            actor ! r // forwards the run request to the container
-            logContainerStart(r, containerState, newData.activeActivationCount, container)
           case None =>
             // this can also happen if createContainer fails to start a new container, or
             // if a job is rescheduled but the container it was allocated to has not yet destroyed itself
@@ -400,6 +408,48 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     ref -> data
   }
 
+  /** (haoran) Create a new container if concurrency limit not met, otherwise, return a dummy state. **/
+  def createContainerIfUnderConcurrencyLimit(kind: String, memoryLimit: ByteSize, actionName: String, state: String): ((ActorRef, ContainerData), String) = {
+    // (haoran) check with the horizontal concurrency records
+    if (ContainerPool.concurrencyLimits.contains(actionName) &&
+      ContainerPool.concurrencyRecords.contains(actionName) &&
+      ContainerPool.concurrencyLimits.get(actionName) <= ContainerPool.concurrencyRecords.get(actionName)) {
+      // if limits are specified and current concurrency >= limit
+      logging.info(
+        this,
+        s"[haoranq4] Concurrency Limit Met - current concurrency of ${actionName} is ${ContainerPool.concurrencyRecords.get(actionName)} >= ${ContainerPool.concurrencyLimits.get(actionName)}")
+      (childFactory(context) -> MemoryData(ByteSize.fromString("0b")), "dummy")
+    } else {
+      if (!ContainerPool.concurrencyLimits.contains(actionName)) {
+        logging.info(
+          this,
+          s"[haoranq4] Concurrency Limit Not Met - ${actionName} does not have a concurrency limit!")
+      } else if (!ContainerPool.concurrencyRecords.contains(actionName)) {
+        logging.info(
+          this,
+          s"[haoranq4] Concurrency Limit Not Met - current concurrency of ${actionName} is 0 < ${ContainerPool.concurrencyLimits.get(actionName)}")
+      } else {
+        logging.info(
+          this,
+          s"[haoranq4] Concurrency Limit Not Met - current concurrency of ${actionName} is ${ContainerPool.concurrencyRecords.get(actionName)} < ${ContainerPool.concurrencyLimits.get(actionName)}")
+      }
+
+      // (haoran) increase concurrency record for the function
+      if (!ContainerPool.concurrencyRecords.contains(actionName)) {
+        ContainerPool.concurrencyRecords += {actionName -> 1}
+      } else {
+        ContainerPool.concurrencyRecords(actionName) += 1
+      }
+      logging.info(
+        this,
+        s"[haoranq4] Added (recreated) - current concurrency of ${actionName} is ${ContainerPool.concurrencyRecords.get(actionName)}")
+
+      val container = createContainer(memoryLimit)
+      incrementColdStartCount(kind, memoryLimit)
+      (container, state)
+    }
+  }
+
   /** Creates a new prewarmed container */
   def prewarmContainer(exec: CodeExec[_], memoryLimit: ByteSize, ttl: Option[FiniteDuration]): Unit = {
     if (hasPoolSpaceFor(busyPool ++ freePool ++ prewarmedPool, prewarmStartingPool, memoryLimit)) {
@@ -511,7 +561,13 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 object ContainerPool {
 
   // (haoran) for managing horizontal concurrency, i.e., how many containers can be created for a function
-  val concurrencyLimits = scala.collection.mutable.Map("base64_mem256_c4" -> 4, "base64_mem256_c2" -> 2)
+  val concurrencyLimits = scala.collection.mutable.Map(
+    "base64_mem384_c8" -> 8,
+    "base64_mem384_c6" -> 6,
+    "base64_mem384_c4" -> 4,
+    "base64_mem384_c2" -> 2,
+    "base64_mem384_c1" -> 1
+  )
   // (haoran) track how many containers have been created for a function
   var concurrencyRecords:scala.collection.mutable.Map[String, Int] = scala.collection.mutable.Map()
 
@@ -595,7 +651,7 @@ object ContainerPool {
       if (concurrencyRecords.contains(data.action.name.name)) {
         concurrencyRecords(data.action.name.name) -= 1
       }
-      logging.info(this, s"[haoranq4] current concurrency of ${data.action.name.name} is ${concurrencyRecords.get(data.action.name.name)}")
+      logging.info(this, s"[haoranq4] Removed - current concurrency of ${data.action.name.name} is ${concurrencyRecords.get(data.action.name.name)}")
 
       // Catch exception if remaining memory will be negative
       val remainingMemory = Try(memory - data.memoryLimit).getOrElse(0.B)
